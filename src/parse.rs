@@ -246,7 +246,7 @@ impl ParserPool {
         if slot.is_none() {
             let mut parser = Parser::new();
             parser
-                .set_language(&grammar(lang))
+                .set_language(&grammar(lang)?)
                 .map_err(|e| anyhow!("set_language failed: {e}"))?;
             *slot = Some(parser);
         }
@@ -1217,14 +1217,19 @@ fn rust_block_has_nested(text: &str) -> bool {
     interior.contains("/*") || interior.contains("*/")
 }
 
-fn grammar(lang: Language) -> tree_sitter::Language {
-    match lang {
+/// Assembly is the one language with no grammar, and it returns an error here
+/// rather than panicking. "parser_for" already rejects it a frame up, so this
+/// arm is unreachable today; a panic in a tool that rewrites source files in
+/// place is a worse way to learn that a future caller found a path around that
+/// guard than a message on stderr and a non-zero exit.
+fn grammar(lang: Language) -> Result<tree_sitter::Language> {
+    Ok(match lang {
         Language::C => tree_sitter_c::LANGUAGE.into(),
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Shell => tree_sitter_bash::LANGUAGE.into(),
-        Language::Asm => unreachable!("assembly has no grammar; scanned by crate::asm"),
-    }
+        Language::Asm => bail!("assembly has no grammar; scanned by crate::asm"),
+    })
 }
 
 #[cfg(test)]

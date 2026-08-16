@@ -1,0 +1,10 @@
+# This tool's contract is that bytes outside comment ranges come back
+# unchanged, and the test suite checks that byte for byte. Git's end-of-line
+# conversion would break that claim before the tests ever run: on a Windows
+# checkout with core.autocrlf=true, every LF in tests/corpus becomes CRLF, so
+# the fixtures no longer hold the shapes they were written to hold.
+#
+# CRLF handling is tested deliberately, from string literals inside the tests
+# (see `had_crlf` in src/normalize.rs and the CRLF cases in tests/cli.rs), never
+# by whatever the checkout happened to produce.
+* -text

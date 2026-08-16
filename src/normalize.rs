@@ -4,7 +4,7 @@ use crate::linekind::{StrippedLine, classify_lines};
 use crate::parse::{Comment, Language};
 use crate::textline::{
     BookendKind, FAST_PATH_TAB_WIDTH, advance_col, block_is_doc, bookend_match, line_is_art_only,
-    split_at_return_boundary,
+    one_sided_banner, split_at_return_boundary,
 };
 
 #[derive(Debug, Clone)]
@@ -73,6 +73,17 @@ pub fn normalize(
     let raw_lines = split_lines(&c.text);
     let mut stripped = strip_prefixes(&raw_lines, kind.style);
     strip_decorative_bookends(&mut stripped, kind);
+
+    // A comment that is nothing but a one-sided banner passes through. Inside a
+    // larger comment "LineKind::Banner" freezes such a line and that is enough,
+    // but a single-line BLOCK also has an opener and a closer to place, and
+    // reshaping those around a body the emitter must not touch yields "/*"
+    // alone above a body still carrying its own "*/". There is nothing to
+    // rewrite here in the first place, so leave the bytes exactly as found.
+    if stripped.len() == 1 && one_sided_banner(&stripped[0].body) {
+        return None;
+    }
+
     let line_marker = source_line_marker(&c.text);
     let block_opener_marker = source_block_opener_marker(&c.text).map(str::to_string);
     let default_continuation_prefix = pick_default_continuation_prefix(&stripped);
@@ -1107,6 +1118,7 @@ fn is_preformatted_kind(k: LineKind) -> bool {
             | LineKind::ReferenceLink
             | LineKind::Metadata
             | LineKind::LabelRow
+            | LineKind::Banner
             | LineKind::Art
     )
 }

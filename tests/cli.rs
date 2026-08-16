@@ -32,7 +32,18 @@ fn run(args: &[&str], input: &[u8]) -> (Option<i32>, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn");
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    // A run that rejects its arguments exits before it ever reads stdin, so this
+    // write races that exit and loses whenever the child wins: EPIPE. That is
+    // the binary behaving correctly, and the assertions that follow are about
+    // the exit code and stderr, which wait_with_output still collects. Only a
+    // real I/O failure is worth failing a test over.
+    let mut stdin = child.stdin.take().unwrap();
+    if let Err(e) = stdin.write_all(input)
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        panic!("write to child stdin: {e}");
+    }
+    drop(stdin);
     let out = child.wait_with_output().unwrap();
     (
         out.status.code(),
@@ -157,6 +168,11 @@ fn files_from_nul_delimited_and_stdin() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+// Unix only because the fixture cannot exist elsewhere: Win32 rejects '\n' in a
+// filename outright (ERROR_INVALID_NAME), so there is no such path to feed the
+// list reader. The reader itself is platform-independent; this is the only
+// platform that can hold the input that proves it.
+#[cfg(unix)]
 #[test]
 fn files_from_nul_path_with_embedded_newline() {
     // A NUL-delimited list must NOT also split on '\n': a path containing a

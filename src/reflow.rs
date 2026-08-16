@@ -2,9 +2,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::classify::{DocFlavor, Style};
 use crate::config::IndentConfig;
-use crate::linekind::{TagShape, doxy_keyword, doxy_tag};
+use crate::linekind::{TagShape, doxy_keyword, doxy_tag, looks_like_email_or_path};
 use crate::normalize::{LineKind, NormalizedDoc, Paragraph, ParagraphKind};
-use crate::textline::{advance_col, split_at_return_boundary};
+use crate::textline::{advance_col, bookend_match, is_kernel_doc_tag, split_at_return_boundary};
 
 const MIN_WRAP_WIDTH: usize = 20;
 const CONTINUATION_INDENT: usize = 4;
@@ -197,7 +197,7 @@ fn emit_paragraphs(
                     // decorative bookend land like every reflowed sibling. The
                     // body itself still goes out verbatim, unwrapped. Metadata
                     // keeps raw replay: a license block is not ours to retouch.
-                    if doc.lines[li].kind == LineKind::LabelRow
+                    if matches!(doc.lines[li].kind, LineKind::LabelRow | LineKind::Banner)
                         && !(skip_first_emit_inline_opener && li == 0)
                     {
                         out.push(
@@ -367,6 +367,27 @@ fn doxygen_hanging_indent(body: &str, effective: usize, flavor: DocFlavor) -> us
     indent
 }
 
+/// A word that would read as a Doxygen or kernel-doc tag if it opened a line.
+///
+/// "looks_like_email_or_path" is the guard "classify_lines" applies, reused
+/// here so the two cannot disagree: "doxy_keyword" truncates "@file.txt" at the
+/// dot and would otherwise read it as the "file" tag. Skipping such a word is
+/// safe as well as tidier, since "kdoc_tag_of" matches the whole keyword and no
+/// convertible spelling carries a dot or a slash.
+///
+/// Not gated on "DocFlavor::Doxygen" the way "classify_lines" is, and that
+/// asymmetry is deliberate. The pass that eats a parked tag,
+/// "normalize::convert_kernel_doc", keys off the source Language, while the
+/// flavor of a plain "//" or "/* */" comment is "None" even in C. Gate this on
+/// flavor and every non-doc C comment loses its protection.
+fn is_tag_start(word: &str) -> bool {
+    let Some(rest) = word.strip_prefix(['@', '\\']) else {
+        return false;
+    };
+    (doxy_tag(doxy_keyword(rest)).is_some() && !looks_like_email_or_path(rest))
+        || is_kernel_doc_tag(word)
+}
+
 /// Greedy line-packing of one paragraph. The first line goes out behind
 /// "prefix" with the full "effective" width; every continuation line is
 /// indented a further "hang" columns and wraps that much earlier.
@@ -387,37 +408,160 @@ fn wrap_segment_aligned(
     // contributes width = UnicodeWidthStr::width(w).
     let mut current = String::new();
     let mut current_width = 0usize;
-    let mut on_first_line = true;
+
+    // Whether we are still filling the first line is derived, not tracked. This
+    // paragraph owns every line it appends from here on, so "appended nothing
+    // yet" and "still on line 1" are the same fact, and a flag for it is a
+    // fourth assignment that can disagree with reality.
+    let first_line_mark = out.len();
+
+    // Where the last word on the line starts, so the tag rule below can peel it
+    // off without rescanning "current" for the final space. "None" means the
+    // line holds a single word, which cannot be peeled: nothing would be left
+    // to emit in front of it.
+    let mut last_word: Option<usize> = None;
 
     for w in body.split_whitespace() {
+        let on_first_line = out.len() == first_line_mark;
         let avail = if on_first_line {
             effective
         } else {
             effective_cont
         };
+
+        // Tracked state has one failure mode a rescan does not: it can fall out
+        // of step with the string. This is the rescan, kept as a debug-only
+        // cross-check so a desync fails a test run instead of silently parking
+        // a tag at a line start. Compiled out of release, where the point is
+        // not paying for it.
+        debug_assert_eq!(
+            last_word,
+            current.rfind(' ').map(|i| i + 1),
+            "last_word drifted from the actual last-word start"
+        );
         let w_width = UnicodeWidthStr::width(w);
         if current.is_empty() {
             current.push_str(w);
             current_width = w_width;
+            last_word = None;
             continue;
         }
+        // Appending is never guarded, only finalizing is. A line that packing
+        // turned into a bookend ("-------- x --------") cannot escape: either a
+        // later word does not fit, and the emit guard below refuses to send it
+        // out, or the paragraph ends on it and the borrow at the bottom does.
+        // Checking here as well was tried and deleted; it failed no test that
+        // those two do not already cover, and it cost a scan per word.
         if current_width + 1 + w_width <= avail {
+            last_word = Some(current.len() + 1);
             current.push(' ');
             current.push_str(w);
             current_width += 1 + w_width;
-        } else {
-            let line_prefix = if on_first_line { prefix } else { cont_prefix };
-            out.push(format!("{line_prefix}{current}"));
-            on_first_line = false;
-            current.clear();
+            continue;
+        }
+
+        // Past here the word does not fit, so a line is going out.
+
+        // Never hand the next pass a line the bookend stripper would rewrite.
+        // A rule token in prose ("a --- b") that a narrow wrap leaves alone on
+        // its line reads as a bare rule on the next run and is deleted, so the
+        // file settles only on the second one. Same trade as the tag rule
+        // below: keep packing and overflow, because an over-long line is
+        // recoverable and a deleted one is not.
+        if bookend_match(&current).is_some() {
+            last_word = Some(current.len() + 1);
+            current.push(' ');
             current.push_str(w);
-            current_width = w_width;
+            current_width += 1 + w_width;
+            continue;
+        }
+
+        let line_prefix = if on_first_line { prefix } else { cont_prefix };
+        if is_tag_start(w) {
+            // Keep the tag off the first column of a continuation line: the
+            // next normalization pass would read it there as a kernel-doc
+            // region and eat the tag word. Break one word earlier so the tag
+            // lands second instead.
+            //
+            // That only works when the word moved down is not itself a tag;
+            // otherwise the break just relocates the problem. With no such
+            // word, let the line overflow. An over-long line is recoverable, a
+            // deleted word is not.
+            // Peeling must not undo the bookend guard above: breaking "--- x"
+            // in front of a tag emits "---" alone, which is the very line that
+            // guard exists to prevent. Fall through to the overflow arm.
+            match last_word {
+                Some(start)
+                    if !is_tag_start(&current[start..])
+                        && bookend_match(&current[..start - 1]).is_none() =>
+                {
+                    let last = current.split_off(start);
+                    current.truncate(start - 1);
+                    out.push(format!("{line_prefix}{current}"));
+                    last_word = Some(last.len() + 1);
+                    current = format!("{last} {w}");
+                    current_width = UnicodeWidthStr::width(current.as_str());
+                }
+                _ => {
+                    last_word = Some(current.len() + 1);
+                    current.push(' ');
+                    current.push_str(w);
+                    current_width += 1 + w_width;
+                }
+            }
+            continue;
+        }
+        out.push(format!("{line_prefix}{current}"));
+        current.clear();
+        current.push_str(w);
+        current_width = w_width;
+        last_word = None;
+    }
+    if current.is_empty() {
+        return;
+    }
+    // The same rule at the paragraph's end, where there is no next word to pack
+    // with. Borrow one from the line above so the rule is not alone, taking care
+    // that neither resulting line is a bookend either: folding the rule straight
+    // onto "-------- x y" would build the two-sided banner this is avoiding.
+    // Only the paragraph's first line has nothing to borrow from, and a
+    // paragraph that is one bare rule was the stripper's business long before
+    // reflow saw it.
+    //
+    // The tests below take the line above as a BODY, not as the emitted line.
+    // Every other bookend test in this file takes a body, and a " * "
+    // continuation prefix would hide a leading rule run from the scan. Which
+    // prefix that line went out behind is known exactly: only the paragraph's
+    // first line uses "prefix".
+    if bookend_match(&current).is_some() && out.len() > first_line_mark {
+        let prev_prefix = if out.len() == first_line_mark + 1 {
+            prefix
+        } else {
+            cont_prefix
+        };
+        let last = out.len() - 1;
+        let prev_body = out[last]
+            .strip_prefix(prev_prefix)
+            .unwrap_or(&out[last])
+            .to_string();
+        if let Some(space) = prev_body.rfind(' ') {
+            let kept = &prev_body[..space];
+            let joined = format!("{} {current}", &prev_body[space + 1..]);
+            if bookend_match(kept).is_none() && bookend_match(&joined).is_none() {
+                out[last] = format!("{prev_prefix}{kept}");
+                current = joined;
+            } else if bookend_match(&format!("{prev_body} {current}")).is_none() {
+                out[last] = format!("{prev_prefix}{prev_body} {current}");
+                return;
+            }
         }
     }
-    if !current.is_empty() {
-        let line_prefix = if on_first_line { prefix } else { cont_prefix };
-        out.push(format!("{line_prefix}{current}"));
-    }
+    let line_prefix = if out.len() == first_line_mark {
+        prefix
+    } else {
+        cont_prefix
+    };
+    out.push(format!("{line_prefix}{current}"));
 }
 
 fn collapse_spaces(s: &str) -> String {

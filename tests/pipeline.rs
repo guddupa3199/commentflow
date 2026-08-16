@@ -360,11 +360,19 @@ fn corpus_files_are_stable() {
             continue;
         };
         let src = std::fs::read_to_string(&path).expect("read corpus file");
-        // pipeline() asserts a second pass is a no-op.
+
+        // A corpus file holds shapes in their SETTLED form, so the first pass
+        // must already be a no-op. Byte equality is the whole assertion: it
+        // covers the code lines, the comment text, and the layout at once, and
+        // it stays meaningful for any file added later, which a check for one
+        // known code line did not. ("pipeline" separately asserts a second pass
+        // changes nothing, which catches a file that oscillates.)
         let out = pipeline(&src, lang, 80);
-        assert!(
-            out.contains("int f(int a, int b);"),
-            "corpus file {} lost its code line",
+        assert_eq!(
+            src,
+            out,
+            "corpus file {} is not a fixed point; if the tool is right, replace \
+             the file with this output, otherwise the shape found a bug",
             path.display()
         );
         seen += 1;
@@ -745,6 +753,79 @@ fn doxygen_param_converts_to_kernel_doc() {
     );
     let pass2 = pipeline(&out, detect("foo.c"), 80);
     assert_eq!(out, pass2, "kernel-doc conversion must be idempotent");
+}
+
+#[test]
+fn mid_paragraph_doxygen_param_does_not_lose_tag_in_line_run() {
+    let src =
+        "int f(void) { return 0; }\n// alpha beta gamma delta epsilon zeta @param eta theta\n";
+    let out = pipeline(src, detect("foo.c"), 40);
+    assert_eq!(
+        out,
+        "int f(void) { return 0; }\n\n// alpha beta gamma delta epsilon\n// zeta @param eta theta\n"
+    );
+    let pass2 = pipeline(&out, detect("foo.c"), 40);
+    assert_eq!(out, pass2, "the tag must survive a second pass");
+}
+
+#[test]
+fn mid_paragraph_doxygen_param_does_not_lose_tag_in_block() {
+    let src =
+        "int f(void) { return 0; }\n/* alpha beta gamma delta epsilon zeta @param eta theta */\n";
+    let out = pipeline(src, detect("foo.c"), 40);
+    assert_eq!(
+        out,
+        "int f(void) { return 0; }\n\n/* alpha beta gamma delta epsilon\n * zeta @param eta theta\n */\n"
+    );
+    let pass2 = pipeline(&out, detect("foo.c"), 40);
+    assert_eq!(out, pass2, "the tag must survive a second pass");
+}
+
+/// Breaking one word earlier is not enough on its own: when the word moved
+/// down is itself a tag, the break relocates the problem instead of solving
+/// it. This body used to come back as "@epsilon : x delta" on the second
+/// pass, losing "param". The packer overflows the line rather than break here.
+#[test]
+fn adjacent_doxygen_tags_do_not_lose_a_tag() {
+    let src = "int f(void) { return 0; }\n// y epsilon zeta y @return @param epsilon x delta\n";
+    let out = pipeline(src, detect("foo.c"), 32);
+    assert_eq!(
+        out,
+        "int f(void) { return 0; }\n\n// y epsilon zeta y @return @param\n// epsilon x delta\n"
+    );
+    let pass2 = pipeline(&out, detect("foo.c"), 32);
+    assert_eq!(out, pass2, "both tags must survive a second pass");
+}
+
+#[test]
+fn non_tag_words_stay_within_the_column_limit() {
+    let src = "int f(void) { return 0; }\n// alpha beta gamma delta epsilon zeta \\0 eta theta\n";
+    let out = pipeline(src, detect("foo.c"), 40);
+    assert_eq!(
+        out,
+        "int f(void) { return 0; }\n\n// alpha beta gamma delta epsilon zeta\n// \\0 eta theta\n"
+    );
+    assert!(out.lines().all(|line| line.chars().count() <= 40));
+    let pass2 = pipeline(&out, detect("foo.c"), 40);
+    assert_eq!(out, pass2);
+}
+
+/// "doxy_keyword" truncates "@file.txt" at the dot, so the tag table answers
+/// "file" for what is really a path. classify_lines already refuses that with
+/// "looks_like_email_or_path" and the packer honors the same guard: the word
+/// wraps like prose and may open a line, because no convertible tag spelling
+/// carries a dot and nothing downstream will eat it.
+#[test]
+fn path_shaped_word_wraps_like_prose() {
+    let src = "int f(void) { return 0; }\n// alpha beta gamma delta epsilon zeta @file.txt eta\n";
+    let out = pipeline(src, detect("foo.c"), 40);
+    assert_eq!(
+        out,
+        "int f(void) { return 0; }\n\n// alpha beta gamma delta epsilon zeta\n// @file.txt eta\n"
+    );
+    assert!(out.lines().all(|line| line.chars().count() <= 40));
+    let pass2 = pipeline(&out, detect("foo.c"), 40);
+    assert_eq!(out, pass2, "the path must survive a second pass intact");
 }
 
 #[test]

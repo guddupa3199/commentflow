@@ -2149,6 +2149,65 @@ fn star_banner_box_collapses_to_single_line() {
     assert!(!out.contains("****"), "star banner frame survived: {out}");
 }
 
+// A banner whose rule run sits on ONE side is not collapsed (a banner must be
+// bracketed on both sides, or "--- a/kernel/sched.c" loses its dashes), which
+// used to leave it as prose for reflow to wrap. The wrap stranded the rule run
+// on its own line, the next pass read that line as a bare rule and deleted it,
+// and the file settled only on its second run. ICU's utf8.h, at the default
+// column limit. The line is frozen now: nothing here wants rewrapping.
+
+#[test]
+fn one_sided_banner_single_line_block_is_left_alone() {
+    let src = "/* single-code point definitions -------------------------------------------- */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 60);
+    assert_eq!(src, out, "one-sided banner was rewritten");
+}
+
+#[test]
+fn one_sided_banner_at_default_limit_is_left_alone() {
+    let src = "/* definitions with backward iteration and a somewhat longer label ------------------- */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 80);
+    assert_eq!(
+        src, out,
+        "one-sided banner was rewritten at the default limit"
+    );
+}
+
+#[test]
+fn one_sided_banner_inside_a_block_is_frozen() {
+    let src = "/*\n * single-code point definitions --------------------------------------------\n *\n * some prose here\n */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 60);
+    assert_eq!(src, out, "banner line inside a block was rewrapped");
+}
+
+#[test]
+fn one_sided_banner_with_the_run_leading_is_frozen() {
+    let src = "/*\n * ------------------------------- label here\n */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 30);
+    assert_eq!(src, out, "leading-run banner was rewrapped");
+}
+
+#[test]
+fn one_sided_banner_in_a_line_comment_is_left_alone() {
+    let src = "// single-code point definitions --------------------------------------------\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 60);
+    assert_eq!(src, out, "one-sided banner in a line comment was rewritten");
+}
+
+/// The freeze is gated on standing alone in a paragraph, because a line ending
+/// in "---" inside one is overwhelmingly a sentence wrapped right after an
+/// em-dash written as three hyphens (apr_pools.h). Freezing that would strand
+/// the rest of the sentence, which is the exact damage this tool repairs.
+#[test]
+fn em_dash_inside_a_paragraph_still_reflows() {
+    let src = "/*\n * a strategy that is fundamentally unsound and quite long indeed ---\n * continues here with more words to wrap around\n */\nint f(void);\n";
+    let out = pipeline(src, detect("foo.c"), 50);
+    assert_eq!(
+        out,
+        "/*\n * a strategy that is fundamentally unsound and\n * quite long indeed --- continues here with more\n * words to wrap around\n */\nint f(void);\n"
+    );
+}
+
 // star_box_around_framed_label_preserved
 #[test]
 fn star_box_around_framed_label_preserved() {
