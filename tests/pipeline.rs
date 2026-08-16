@@ -345,39 +345,87 @@ fn metadata_copyright_with_year_preserved() {
     );
 }
 
-/// Every file under "tests/corpus/" reproduces a shape from a real header that
-/// this tool got wrong. Running them here is mostly about the convergence
-/// assertion inside the shared "pipeline" helper: hand-written cases kept
-/// missing the shapes that actually break, so the corpus is where real-world
-/// input lives.
+/// Every file under "tests/corpus/" reproduces a shape from real source that
+/// this tool got wrong. Hand-written cases kept missing the shapes that
+/// actually break, so the corpus is where real-world input lives: a whole file
+/// at a time, which is the only way to hold the shapes that need file context
+/// (a byte-0 shebang, a heredoc body, an unterminated block at EOF). Byte
+/// equality against the recorded sibling is the assertion; the convergence
+/// check inside the shared "pipeline" helper rides along on top of it.
 #[test]
-fn corpus_files_are_stable() {
+fn corpus_files_match_expected() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
-    let mut seen = 0;
-    for entry in std::fs::read_dir(&dir).expect("read tests/corpus") {
-        let path = entry.expect("corpus entry").path();
-        let Some(lang) = parse::detect_language(&path).ok() else {
-            continue;
-        };
-        let src = std::fs::read_to_string(&path).expect("read corpus file");
 
-        // A corpus file holds shapes in their SETTLED form, so the first pass
-        // must already be a no-op. Byte equality is the whole assertion: it
-        // covers the code lines, the comment text, and the layout at once, and
-        // it stays meaningful for any file added later, which a check for one
-        // known code line did not. ("pipeline" separately asserts a second pass
-        // changes nothing, which catches a file that oscillates.)
+    // Sorted, so a failure names the same file on every filesystem; "read_dir"
+    // order is unspecified. The ".expected" siblings are the one thing held
+    // back from the run. Anything else "detect_language" rejects is a file
+    // somebody put here expecting it to be tested, and skipping it silently is
+    // exactly the failure this test is supposed to make impossible.
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("read tests/corpus")
+        .map(|e| e.expect("corpus entry").path())
+        .collect();
+    entries.sort();
+    let (siblings, inputs): (Vec<PathBuf>, Vec<PathBuf>) = entries
+        .into_iter()
+        .partition(|p| p.extension().is_some_and(|e| e == "expected"));
+
+    assert!(
+        !inputs.is_empty(),
+        "no corpus files found in {}",
+        dir.display()
+    );
+
+    for path in &inputs {
+        let lang = parse::detect_language(path)
+            .unwrap_or_else(|e| panic!("corpus file {}: {e}", path.display()));
+        let src = std::fs::read_to_string(path).expect("read corpus file");
+
+        // Append rather than "with_extension": a corpus file may legitimately
+        // have NO extension (the extensionless-shebang carve-out makes one a
+        // supported shell input), and "with_extension" would then produce
+        // "script..expected" and, for a dotfile, eat the name itself.
+        let mut expected_name = path.clone().into_os_string();
+        expected_name.push(".expected");
+        let expected_path = PathBuf::from(expected_name);
+
+        // Byte equality against a recorded output is the whole assertion: it
+        // covers the code lines, the comment text, and the layout at once, for
+        // any language, which the old check for one known C declaration did
+        // not. Reading the sibling with "expect" rather than skipping is what
+        // makes a deleted ".expected" a failure. ("pipeline" separately asserts
+        // a second pass changes nothing, so a file that oscillates is caught
+        // even when its first pass matches.)
+        let expected = std::fs::read_to_string(&expected_path).unwrap_or_else(|e| {
+            panic!("read {}: {e}", expected_path.display());
+        });
         let out = pipeline(&src, lang, 80);
         assert_eq!(
-            src,
+            expected,
             out,
-            "corpus file {} is not a fixed point; if the tool is right, replace \
-             the file with this output, otherwise the shape found a bug",
-            path.display()
+            "corpus file {} no longer produces {}; if the tool is right, \
+             replace the sibling with this output, otherwise the shape found a \
+             bug",
+            path.display(),
+            expected_path.display()
         );
-        seen += 1;
     }
-    assert!(seen > 0, "no corpus files found in {}", dir.display());
+
+    // The mirror of the missing-sibling failure above. A ".expected" whose
+    // input is gone (a rename that only touched one of the pair, a deleted
+    // shape) is a file this loop never opens, so nothing else in the suite
+    // would ever notice it went stale.
+    for sibling in &siblings {
+        // The inverse of the push above: "partition" guarantees the extension
+        // here is exactly "expected", so stripping it cannot eat anything else.
+        let input = sibling.with_extension("");
+        assert!(
+            inputs.contains(&input),
+            "{} has no corpus input {}; delete the orphan or restore its input",
+            sibling.display(),
+            input.display()
+        );
+    }
 }
 
 #[test]
@@ -1166,6 +1214,71 @@ void f(void)
     );
     // Idempotent.
     assert_eq!(pipeline(&out, detect("font.c"), 80), out);
+}
+
+#[test]
+fn plan_no_blank_before_comment_under_bom_directive() {
+    // Both "#" lines that suppress the blank line go through one parser, so the
+    // BOM strip reaches each of them. It used to reach only the shebang arm,
+    // which left a BOM'd guard failing the test its BOM-free twin passes:
+    // U+FEFF is not Unicode White_Space, so "trim" leaves it glued to the "#".
+    let guard = "\u{feff}#ifndef GUARD\n/* A header long enough to stay multi-line once the reflow has run over it. */\nint x;\n#endif\n";
+    let out = pipeline(guard, detect("g.h"), 80);
+    assert!(
+        out.contains("#ifndef GUARD\n/* A header"),
+        "blank line wrongly inserted after a BOM-prefixed #ifndef:\n{out}"
+    );
+
+    // The shebang arm, same rule, with the BOM the corpus fixture carries.
+    let script = "\u{feff}#!/bin/sh\n# A header long enough to stay multi-line once the reflow has run over it here.\nexit 0\n";
+    let out = pipeline(script, detect("s.sh"), 80);
+    assert!(
+        out.contains("#!/bin/sh\n# A header"),
+        "blank line wrongly inserted under a BOM-prefixed shebang:\n{out}"
+    );
+}
+
+#[test]
+fn plan_blank_line_under_rust_inner_attribute() {
+    // "#![no_std]" sits exactly where a shebang does and starts with "#!", so
+    // the shell carve-out read it as one and suppressed the blank line under
+    // it. It is a Rust inner attribute: ordinary code, and the comment below it
+    // is explaining that code.
+    let src = "#![no_std]\n// A comment long enough that it stays multi-line once the packer has run over it.\nfn f() {}\n";
+    let out = pipeline(src, detect("a.rs"), 80);
+    assert!(
+        out.contains("#![no_std]\n\n//"),
+        "no blank line under a Rust inner attribute:\n{out}"
+    );
+
+    // The shell shebang it was confused with still suppresses it.
+    let sh = "#!/bin/sh\n# A comment long enough that it stays multi-line once the packer has run over it.\nexit 0\n";
+    let out = pipeline(sh, detect("s.sh"), 80);
+    assert!(
+        out.contains("#!/bin/sh\n#"),
+        "blank line wrongly inserted under a shebang:\n{out}"
+    );
+}
+
+#[test]
+fn param_drift_needs_exactly_one_comment_after_paren() {
+    // One comment after ")" is the tell that the set is displaced by one. Two
+    // is not that shape, and shifting both onto the last parameter invents a
+    // grouping the author never wrote, so the whole signature passes through.
+    let two = "void f(int a, /* the b */ int b) /* one */ /* two */ {\n    g();\n}\n";
+    assert_eq!(
+        pipeline(two, detect("d.c"), 80),
+        two,
+        "two trailing comments must not shift"
+    );
+
+    // The documented one-comment drift still fires.
+    let one = "void f(int a, /* the b */ int b) /* the c */ {\n    g();\n}\n";
+    let out = pipeline(one, detect("e.c"), 80);
+    assert!(
+        out.contains("void f(int a /* the b */, int b /* the c */)"),
+        "one-step drift no longer shifts:\n{out}"
+    );
 }
 
 #[test]

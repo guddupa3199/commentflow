@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::signature::{collect_param_shifts, manpage_relocate_target};
 use crate::textline::{
     block_is_doc, fence_marker_run, is_art, is_horizontal_rule, is_indented_code, is_table_row,
 };
@@ -353,228 +354,6 @@ fn merge_comment_groups(comments: Vec<Comment>, source: &str) -> Vec<Comment> {
     out
 }
 
-/// Detect C/C++ signatures whose parameter comments all drifted forward by one:
-/// every parameter after the first carries exactly one *leading* comment (the
-/// ", comment param" shape inside "parameter_list"), plus exactly one comment
-/// trailing the closing ")". That extra trailing comment is the tell that the
-/// whole set is displaced: normal leading comments describe the *following*
-/// parameter and leave nothing after ")". Returns a map from each drifted
-/// comment's start byte to the offset where it should become a trailing comment
-/// (the end of the parameter it actually describes: the previous one, or the
-/// last parameter for the after-")" comment). Any deviation (a parameter with
-/// zero or two leading comments, a missing trailing comment, a leading comment
-/// on the first parameter) yields no entry for that function, so the transform
-/// never fires on an ordinary signature. Idempotent: once shifted, each comment
-/// sits as "param comment ," (before the comma), which is not the drift shape.
-fn collect_param_shifts(root: Node, source: &str, lang: Language) -> HashMap<usize, ParamShift> {
-    let mut map = HashMap::new();
-    if !matches!(lang, Language::C | Language::Cpp) {
-        return map;
-    }
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "function_definition" {
-            detect_param_drift(node, source, lang, &mut map);
-        }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-    map
-}
-
-fn detect_param_drift(
-    func: Node,
-    source: &str,
-    lang: Language,
-    map: &mut HashMap<usize, ParamShift>,
-) {
-    let Some(decl) = func.child_by_field_name("declarator") else {
-        return;
-    };
-    if decl.kind() != "function_declarator" {
-        return;
-    }
-    let Some(plist) = decl.child_by_field_name("parameters") else {
-        return;
-    };
-    if plist.kind() != "parameter_list" {
-        return;
-    }
-    let text_of = |node: Node| &source[node.start_byte()..node.end_byte()];
-    // The comment group trailing ")" (between the declarator and the body).
-    let body_start = func.child_by_field_name("body").map(|b| b.start_byte());
-    let mut trailing: Vec<Node> = Vec::new();
-    let mut cursor = func.walk();
-    for child in func.children(&mut cursor) {
-        if child.kind() == "comment"
-            && child.start_byte() >= decl.end_byte()
-            && body_start.is_none_or(|b| child.end_byte() <= b)
-        {
-            trailing.push(child);
-        }
-    }
-    if trailing.is_empty() {
-        return;
-    }
-    // A real manual-page block after ")" belongs to transform 3, not here.
-    if trailing
-        .iter()
-        .any(|&t| has_manpage_section_headers(text_of(t)))
-    {
-        return;
-    }
-
-    // Only "/* */" blocks shift; a "//" line comment would swallow the code
-    // after it once moved inline.
-    if trailing.iter().any(|&t| !is_block_comment(text_of(t))) {
-        return;
-    }
-
-    // Parse the parameter_list into (param, leading comment group). Shape must
-    // be "(" param ("," comment* param)* ")": the first parameter has no
-    // leading comment; each later parameter may carry a whole group ("/* a */
-    // /* b */"), all of which shift together. A comment before the first param
-    // or stray tokens bail.
-    let mut pcur = plist.walk();
-    let kids: Vec<Node> = plist.children(&mut pcur).collect();
-    let mut params: Vec<(Node, Vec<Node>)> = Vec::new();
-    let mut i = 0;
-    if kids.first().map(Node::kind) != Some("(") {
-        return;
-    }
-    i += 1;
-    if kids.get(i).map(Node::kind) != Some("parameter_declaration") {
-        return; // no first param, or a comment leads it
-    }
-    params.push((kids[i], Vec::new()));
-    i += 1;
-    while kids.get(i).map(Node::kind) == Some(",") {
-        i += 1;
-        let mut group = Vec::new();
-        while kids.get(i).map(Node::kind) == Some("comment") {
-            if !is_block_comment(text_of(kids[i])) {
-                return; // "//" line comment; see the trailing check
-            }
-            group.push(kids[i]);
-            i += 1;
-        }
-        if kids.get(i).map(Node::kind) != Some("parameter_declaration") {
-            return; // a missing param
-        }
-        params.push((kids[i], group));
-        i += 1;
-    }
-    if kids.get(i).map(Node::kind) != Some(")") || i != kids.len() - 1 {
-        return;
-    }
-
-    // The commented parameters must form a contiguous suffix ending at the last
-    // parameter (they and the after-")" group are all displaced forward by
-    // one). The first parameter must be uncommented (nowhere to shift back to).
-    let Some(m) = params.iter().position(|(_, g)| !g.is_empty()) else {
-        return; // no leading comments at all
-    };
-    if m == 0 || !params[m..].iter().all(|(_, g)| !g.is_empty()) {
-        return;
-    }
-
-    // A machine directive (NOLINT, ACSL, cppcheck, ...) in the drifted set must
-    // not move. This transform is atomic over the whole signature: shifting
-    // some comments while one stays put scrambles the parameter/comment pairing
-    // into a state that is neither the original nor a clean de-drift. So if any
-    // participant can't shift, abort the whole signature to passthrough.
-    if trailing
-        .iter()
-        .chain(params[m..].iter().flat_map(|(_, g)| g))
-        .any(|&n| is_passthrough_directive(text_of(n), lang))
-    {
-        return;
-    }
-
-    // Shift each group back one: the group leading params[i] describes
-    // params[i-1]; the after-")" group describes the last parameter.
-    for i in m..params.len() {
-        let target = params[i - 1].0.end_byte();
-        for comment in &params[i].1 {
-            map.insert(
-                comment.start_byte(),
-                ParamShift {
-                    insert_at: target,
-                    after_paren: false,
-                },
-            );
-        }
-    }
-    let last_end = params[params.len() - 1].0.end_byte();
-    for comment in &trailing {
-        map.insert(
-            comment.start_byte(),
-            ParamShift {
-                insert_at: last_end,
-                after_paren: true,
-            },
-        );
-    }
-}
-
-/// A drifted parameter comment is only shiftable when it is a "/* … */" block:
-/// a "//" line comment moved inline would comment out the following code. A
-/// multi-line block is allowed but collapsed to one line on re-insert (see
-/// "plan"), so it can't round-trip through the trailing-closer split.
-fn is_block_comment(text: &str) -> bool {
-    text.starts_with("/*")
-}
-
-fn has_manpage_section_headers(text: &str) -> bool {
-    let mut description = false;
-    let mut returns = false;
-    for part in text.split(['\n', '\r', '*']) {
-        let word = part
-            .trim_start_matches('/')
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_end_matches(':');
-        description |= word == "DESCRIPTION";
-        returns |= matches!(word, "RETURN" | "RETURNS");
-    }
-    description && returns
-}
-
-/// A C/C++ block comment wedged between a function's signature and its body
-/// ("type name(...) /* here */ { ... }") is the X11 manual-page placement.
-/// When the comment carries "DESCRIPTION"/"RETURN" sections, normalize hoists
-/// it ahead of the function; this returns the insert target (the physical line
-/// start of the "function_definition"). Any other position yields "None", so
-/// the relocation never fires for an ordinary comment.
-///
-/// "parent" is the comment's enclosing node, handed down by the walk. Asking
-/// tree-sitter for it instead ("Node::parent") costs a fresh descent from the
-/// root, which is quadratic over a long run of sibling comments.
-fn manpage_relocate_target(
-    node: Node,
-    parent: Option<Node>,
-    source: &str,
-    lang: Language,
-) -> Option<usize> {
-    if !matches!(lang, Language::C | Language::Cpp) {
-        return None;
-    }
-    let parent = parent?;
-    if parent.kind() != "function_definition" {
-        return None;
-    }
-    let decl = parent.child_by_field_name("declarator")?;
-    let body = parent.child_by_field_name("body")?;
-    if node.start_byte() >= decl.end_byte() && node.end_byte() <= body.start_byte() {
-        Some(line_start_before(source, parent.start_byte()))
-    } else {
-        None
-    }
-}
-
 /// Distinct marker shapes for line-comment grouping. Hash-run kinds are
 /// length-tagged because "# foo" and "## bar" must NOT merge into one
 /// paragraph: shell convention treats the run length as a visual heading
@@ -889,7 +668,7 @@ fn is_lint_directive(text: &str, lang: Language) -> bool {
 /// shellcheck, cbindgen. commentflow must never reflow, merge, relocate, or
 /// blank-line-detach these. (The Rust nested-"/* */" case is a grammar
 /// constraint, not a tool directive, so it stays inline at the one call site.)
-fn is_passthrough_directive(text: &str, lang: Language) -> bool {
+pub(crate) fn is_passthrough_directive(text: &str, lang: Language) -> bool {
     is_formatter_directive(text)
         || is_cppcheck_suppress(text)
         || (matches!(lang, Language::C | Language::Cpp) && is_acsl_annotation(text))
@@ -960,6 +739,54 @@ fn spans_bare_cr(source: &str, start_byte: usize, end_byte: usize) -> bool {
         .any(|(i, &b)| b == b'\r' && bytes.get(start_byte + i + 1) != Some(&b'\n'))
 }
 
+/// True when a C/C++ line comment carries a backslash-newline line splice.
+///
+/// A "\" at the end of a line splices the next line onto it before the comment
+/// is even lexed, so a "//" comment written that way already extends past its
+/// own line and the grammar reports one node spanning both. Two things then go
+/// wrong, and neither is recoverable downstream:
+///
+/// - Reflow can leave the "\" as the last thing on the LAST emitted line, and
+///   the splice then swallows the CODE line below into the comment. It costs
+///   nothing to write ("// a b c \" packs exactly that way at the right width).
+/// - Deleting an interior line that is nothing but whitespace, which is
+///   correct as comment-interior whitespace, re-points an existing splice from
+///   that blank line onto the next code line. The comment text need not be
+///   reflowed at all for this to fire, so no width is safe.
+///
+/// The second pass then reads the swallowed code as comment prose and packs it,
+/// so "--check" converges on the damage instead of reporting it. This is the
+/// "spans_bare_cr" case exactly: it destroys code, no amount of downstream care
+/// can undo it, so refuse the comment outright.
+///
+/// Only C/C++ line comments. Rust has no line splicing, shell comments end at
+/// the newline, and assembly claims only "/* */". A block comment is safe in
+/// every language: "*/" terminates it whatever the preceding byte was. A "\"
+/// anywhere else in the prose (a path, an escape) is untouched: only one
+/// followed by nothing but horizontal whitespace to the line's end splices.
+fn spans_line_splice(text: &str, lang: Language) -> bool {
+    if !matches!(lang, Language::C | Language::Cpp) || !text.starts_with("//") {
+        return false;
+    }
+    text.lines().any(ends_with_line_splice)
+}
+
+/// True when this physical line is continued onto the next one by a trailing
+/// "\", the translation-phase-2 splice.
+///
+/// The one place this rule is written down. It had three encodings before, two
+/// of them "trim_end().ends_with('\\')" and this one a byte-class walk, and
+/// they disagreed: "trim_end" strips Unicode whitespace, so a "\" followed by a
+/// no-break space was a splice to two callers and not to the third. It is not
+/// one to any compiler either, which is why the horizontal-whitespace set is
+/// the form that survived. The callers ask the same question for different
+/// reasons (does this comment sit inside a macro, may transform 5 put a blank
+/// line here, is this comment's extent load-bearing), and only one definition
+/// of a cpp rule should exist to answer them.
+pub(crate) fn ends_with_line_splice(line: &str) -> bool {
+    line.trim_end_matches([' ', '\t', '\r']).ends_with('\\')
+}
+
 /// Build a "Comment" from a byte span, deriving everything else from the
 /// source. Shared by the tree-sitter walk and the assembly scanner so the two
 /// producers can't drift on indent capture, trailing detection, or the
@@ -975,7 +802,8 @@ fn make_comment(
     let text = source[start_byte..end_byte].to_string();
     let force_passthrough = (lang == Language::Rust && rust_block_has_nested(&text))
         || is_passthrough_directive(&text, lang)
-        || spans_bare_cr(source, start_byte, end_byte);
+        || spans_bare_cr(source, start_byte, end_byte)
+        || spans_line_splice(&text, lang);
     let line_start = line_start_before(source, start_byte);
     let line_prefix = &source[line_start..start_byte];
     let is_trailing = line_prefix.chars().any(|c| !c.is_whitespace());
@@ -1154,7 +982,7 @@ fn is_inside_preprocessor_directive(start_byte: usize, source: &str) -> bool {
         // "\" line-continuation; otherwise this comment stands on its own.
         let prev_end = line_start - 1;
         let prev_start = line_start_before(source, prev_end);
-        if !source[prev_start..prev_end].trim_end().ends_with('\\') {
+        if !ends_with_line_splice(&source[prev_start..prev_end]) {
             return false;
         }
         line_end = prev_end;
@@ -1328,6 +1156,45 @@ mod tests {
         assert!(cs.iter().all(|c| c.param_shift.is_none()));
         let directive = cs.iter().find(|c| c.text.contains("NOLINT")).unwrap();
         assert!(directive.force_passthrough);
+    }
+
+    #[test]
+    fn backslash_continued_line_comment_is_passthrough() {
+        // The shape that deleted a line of code: the comment's own continuation
+        // is whitespace-only, so removing it (correct, as comment-interior
+        // whitespace) re-points the splice onto "int x = 1;" and the next pass
+        // reads the declaration as prose. Nothing downstream can undo that, so
+        // the comment never enters the pipeline.
+        let cs = extract_comments("// aaa bbb \\\n   \nint x = 1;\n", Language::C).unwrap();
+        assert!(cs[0].force_passthrough);
+
+        // Also when the continuation carries text: reflow is free to pack the
+        // "\" onto the last emitted line, where it swallows the code below.
+        let cs = extract_comments("// aaa \\\nbbb ccc\nint x = 1;\n", Language::Cpp).unwrap();
+        assert!(cs[0].force_passthrough);
+
+        // A "\" as the file's very last byte is NOT this: the grammar leaves it
+        // out of the node ("// aaa bbb " comes back), and there is no line
+        // after EOF for a splice to swallow anyway.
+        let cs = extract_comments("// aaa bbb \\", Language::C).unwrap();
+        assert!(!cs[0].force_passthrough);
+    }
+
+    #[test]
+    fn backslash_inside_prose_still_reflows() {
+        // Only a "\" with nothing but horizontal whitespace after it splices. A
+        // path or an escape mid-line is ordinary text, and freezing every
+        // comment that mentions one would gut the tool.
+        let cs = extract_comments("// see C:\\Users\\me for the log file\n", Language::C).unwrap();
+        assert!(!cs[0].force_passthrough);
+
+        // A block comment is safe whatever precedes the newline: "*/" ends it.
+        let cs = extract_comments("/* aaa \\\n * bbb */\n", Language::C).unwrap();
+        assert!(!cs[0].force_passthrough);
+
+        // Rust has no line splicing, so its line comments are never frozen.
+        let cs = extract_comments("// aaa \\\n// bbb\n", Language::Rust).unwrap();
+        assert!(!cs[0].force_passthrough);
     }
 
     #[test]
