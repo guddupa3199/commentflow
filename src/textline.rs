@@ -312,6 +312,47 @@ pub(crate) fn bookend_match(body: &str) -> Option<BookendKind> {
     Some(BookendKind::Labeled(label.to_string()))
 }
 
+/// A banner whose rule run sits on ONE side only: "label -------" or
+/// "------- label".
+///
+/// "bookend_match" deliberately refuses these, because a run on one side is
+/// often content ("--- a/kernel/sched.c"), so collapsing it would delete bytes.
+/// That leaves the line as ordinary prose, which reflow then wraps, and the
+/// wrap is where the damage happens: the rule run lands alone on the next line,
+/// the following pass reads that line as a bare rule and deletes it, and the
+/// file settles only on its second run. ICU's utf8.h hits this at the default
+/// column limit. Freezing the line fixes the convergence hole and is better
+/// output anyway, since a decorative rule split across two lines is not a shape
+/// anyone asked for.
+///
+/// Caller's job: only freeze a line that stands ALONE in its paragraph. Inside
+/// a paragraph a trailing "---" is usually a sentence wrapped right after an
+/// em-dash written as three hyphens, and freezing that strands the rest of it.
+pub(crate) fn one_sided_banner(body: &str) -> bool {
+    // An all-rule line, and a run bracketed on both sides, are bookend_match's
+    // business. This is only the shapes it hands back as prose.
+    if bookend_match(body).is_some() {
+        return false;
+    }
+    let is_rule = |c: char| c == '-' || c == '=' || c == '*';
+    let uniform = |run: &[char]| run.windows(2).all(|w| w[0] == w[1]);
+    let chars: Vec<char> = body.trim().chars().collect();
+
+    let lead = chars.iter().take_while(|&&c| is_rule(c)).count();
+    let trail = chars.iter().rev().take_while(|&&c| is_rule(c)).count();
+
+    let leads =
+        lead >= 3 && uniform(&chars[..lead]) && chars.get(lead).is_some_and(|c| c.is_whitespace());
+    let trails = trail >= 3
+        && uniform(&chars[chars.len() - trail..])
+        && chars
+            .len()
+            .checked_sub(trail + 1)
+            .and_then(|before| chars.get(before))
+            .is_some_and(|c| c.is_whitespace());
+    leads || trails
+}
+
 /// True when a stripped-line body is art-like and non-empty after trim. Used
 /// by the bookend-strip adjacency check to protect multi-line ASCII drawings
 /// ("+----+", "|  |", "| label |") from getting their bordering dash runs

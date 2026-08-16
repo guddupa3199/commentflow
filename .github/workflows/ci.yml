@@ -12,11 +12,19 @@ on:
 # Runner images are pinned to a release rather than `-latest`, so an image
 # rollover is a deliberate bump in this file instead of a surprise on a Monday.
 jobs:
+  # Windows is in this matrix because the `build` job below ships a Windows
+  # binary, and a released artifact whose test suite has never run on the target
+  # is a promise nobody checked. It is also the platform where this tool differs
+  # most: `write_atomic` compiles out its whole `#[cfg(unix)]` permission branch,
+  # `fs::rename` has its own replace semantics, and line endings are load-bearing
+  # throughout (`had_crlf`, `spans_bare_cr`). Compiling that is not the same as
+  # running it. `.gitattributes` pins `* -text` so a Windows checkout is byte
+  # identical to a Linux one, which keeps the corpus fixtures honest.
   check:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, macos-15, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -26,19 +34,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # fmt, clippy -D warnings, and the test suite. Same script a contributor
       # runs locally, so CI cannot drift from `make indent` plus `cargo test`.
+      # `shell: bash` picks Git Bash on the Windows runner, whose default is
+      # pwsh; the script itself stays one script for every platform.
       - run: ./scripts/check.sh
-
-  # The write path has a `#[cfg(unix)]` branch (create-time file mode) and three
-  # `#[cfg(unix)]` tests. Windows compiles those out, which is a claim worth
-  # checking. Compile only: the test suite has never been run on Windows, so
-  # asserting it passes there would be asserting something unverified.
-  windows-build:
-    runs-on: windows-2025
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
+        shell: bash
 
   # `rust-version` in Cargo.toml is a promise. This is the only thing that keeps
   # it honest: the crate uses let-chains, stabilized in 1.88, so that is the

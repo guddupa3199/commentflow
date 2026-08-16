@@ -11,7 +11,7 @@
 use crate::classify::DocFlavor;
 use crate::textline::{
     FAST_PATH_TAB_WIDTH, advance_col, bookend_match, fence_marker_run, is_art, is_indented_code,
-    is_kernel_doc_tag, is_table_row, line_is_art_only,
+    is_kernel_doc_tag, is_table_row, line_is_art_only, one_sided_banner,
 };
 
 /// One comment source line with its marker prefix split off: "prefix" is what
@@ -53,6 +53,11 @@ pub enum LineKind {
     /// of replaying raw source. Keeping the two kinds apart leaves license
     /// blocks byte-identical.
     LabelRow,
+    /// A banner with its rule run on one side only ("label -------"). Emitted
+    /// exactly like "LabelRow"; a separate kind because the reason differs, and
+    /// so a reader chasing "Key: value" behavior is not sent to a dash rule.
+    /// See "textline::one_sided_banner".
+    Banner,
 }
 
 /// What a Doxygen tag does to the line that carries it.
@@ -168,7 +173,9 @@ enum DoxyState {
 ///   8. Blockquote, reference link, table row, indented code. All preformatted.
 ///   9. Label runs. Deliberately AFTER indented code: a "Key: value" line with a
 ///      code sample's indentation belongs to the sample. See "is_label_run".
-///  10. Art, list item, and finally prose as the fallback.
+///  10. One-sided banners ("label -------"), which freeze only when they stand
+///      alone in a paragraph. See "textline::one_sided_banner".
+///  11. Art, list item, and finally prose as the fallback.
 ///
 /// A check that yields a preformatted kind can be reordered against other
 /// preformatted checks without changing output (they all emit the same way);
@@ -308,6 +315,18 @@ pub(crate) fn classify_lines(
             continue;
         }
 
+        // A one-sided banner freezes only when it stands alone in its
+        // paragraph. Inside a paragraph, a line ending in "---" is far more
+        // often a sentence wrapped right after an em-dash written as three
+        // hyphens ("a fundamentally unsound strategy ---" in apr_pools.h), and
+        // freezing that would strand the rest of the sentence on its own.
+        let alone_above = i == 0 || lines[i - 1].body.trim().is_empty();
+        let alone_below = lines.get(i + 1).is_none_or(|l| l.body.trim().is_empty());
+        if alone_above && alone_below && one_sided_banner(body) {
+            out[i] = LineKind::Banner;
+            continue;
+        }
+
         if is_art(body) {
             out[i] = LineKind::Art;
             continue;
@@ -337,7 +356,7 @@ fn is_art_adjacent_bookend(lines: &[StrippedLine], i: usize) -> bool {
     above_art || below_art
 }
 
-fn looks_like_email_or_path(stripped: &str) -> bool {
+pub(crate) fn looks_like_email_or_path(stripped: &str) -> bool {
     let token: String = stripped
         .chars()
         .take_while(|c| !c.is_whitespace())
