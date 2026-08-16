@@ -1,0 +1,21 @@
+[package]
+name = "commentflow"
+version = "0.1.0"
+edition = "2024"
+# Let-chains, stabilized in 1.88, are the binding constraint. The msrv job in
+# CI is what keeps this line true.
+rust-version = "1.88"
+license = "MIT"
+
+[dependencies]
+tree-sitter = "=0.26.12"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-bash = "=0.25.1"
+anyhow = "=1.0.104"
+similar = "=3.1.2"
+unicode-width = "=0.2.2"
+
+[profile.release]
+lto = "thin"

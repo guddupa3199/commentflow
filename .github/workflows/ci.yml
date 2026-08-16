@@ -1,0 +1,91 @@
+name: check
+
+on:
+  push:
+  pull_request:
+  # Dependencies are pinned with `=`, so a newly disclosed advisory will never
+  # arrive on its own. The weekly run is what turns the audit job below into an
+  # actual alarm rather than a check that only fires when someone pushes.
+  schedule:
+    - cron: '17 4 * * 1'
+
+# Runner images are pinned to a release rather than `-latest`, so an image
+# rollover is a deliberate bump in this file instead of a surprise on a Monday.
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # fmt, clippy -D warnings, and the test suite. Same script a contributor
+      # runs locally, so CI cannot drift from `make indent` plus `cargo test`.
+      - run: ./scripts/check.sh
+
+  # The write path has a `#[cfg(unix)]` branch (create-time file mode) and three
+  # `#[cfg(unix)]` tests. Windows compiles those out, which is a claim worth
+  # checking. Compile only: the test suite has never been run on Windows, so
+  # asserting it passes there would be asserting something unverified.
+  windows-build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  # `rust-version` in Cargo.toml is a promise. This is the only thing that keeps
+  # it honest: the crate uses let-chains, stabilized in 1.88, so that is the
+  # floor until something newer is used.
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --deny warnings
+
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: macOS arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - name: Windows x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: commentflow-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/commentflow${{ runner.os == 'Windows' && '.exe' || '' }}
