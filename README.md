@@ -71,6 +71,32 @@ one spacing rule:
 - Blank line before a block: An explanatory comment dropped flush onto the
   statement above it gets one blank line.
 
+## Prebuilt Binaries
+
+Every push to `main` that passes the test suite on all three platforms replaces
+the [`latest`](https://github.com/sysprog21/commentflow/releases/tag/latest)
+release. There is one tarball per target, and only the newest build is kept:
+
+| Platform | Asset |
+| --- | --- |
+| Linux x86\_64 | `commentflow-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS arm64 | `commentflow-aarch64-apple-darwin.tar.gz` |
+| Windows x86\_64 | `commentflow-x86_64-pc-windows-msvc.tar.gz` |
+
+The Linux asset is spelled out below; substitute the row above that matches the
+machine you are on.
+
+```sh
+curl -fsSL https://github.com/sysprog21/commentflow/releases/download/latest/commentflow-x86_64-unknown-linux-gnu.tar.gz | tar xz
+./commentflow --help
+```
+
+`tar` extracts all three, Windows included: `bsdtar` has shipped with Windows
+since 10 1803. These binaries carry no Developer ID signature. The `curl` line
+above attaches no quarantine attribute, so what it extracts runs as is; a copy
+fetched through a browser is quarantined until
+`xattr -d com.apple.quarantine commentflow` clears it.
+
 ## Usage
 
 ```sh
