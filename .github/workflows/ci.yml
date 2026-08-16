@@ -59,6 +59,149 @@ jobs:
       - run: cargo install cargo-audit --locked
       - run: cargo audit --deny warnings
 
+  # "src/" contains no "unsafe" block, so the only memory these can find a bug in
+  # is the linked C: the four tree-sitter grammar crates and the runtime, driven
+  # by whatever "tests/corpus" and the suite feed them. That is also why "CFLAGS"
+  # is the load-bearing half of each job. Without it the "cc"-compiled grammars
+  # stay uninstrumented and the run reports zero findings because it checked
+  # nothing, which is worse than having no job at all. The "verify" step below
+  # exists to make that failure loud.
+  #
+  # "continue-on-error" on both, until each has run green twice. A nightly-only
+  # job that breaks on a toolchain roll must not block unrelated PRs on day one,
+  # and leaving that promise to a branch-protection setting puts it somewhere no
+  # reviewer of this file can see. Delete the two lines to make them blocking.
+  #
+  # "CC=clang" because rustc links LLVM's sanitizer runtime and the runner's
+  # default "CC" is gcc; gcc-instrumented objects against LLVM's runtime is a
+  # coin flip. The explicit "--target" is for "RUSTFLAGS", which cargo then keeps
+  # out of build scripts and proc macros; it does not stop "CFLAGS" reaching
+  # them, and does not need to ("cc" tries "CFLAGS_<target>" and "TARGET_CFLAGS"
+  # first, then falls back to a bare "CFLAGS").
+  #
+  # "-Zbuild-std" is deliberately omitted. Without it "std" stays uninstrumented,
+  # which is the right trade here: the target is the C, and rebuilding std per
+  # job costs more than it finds. Do not "fix" this later.
+  #
+  # Not here and not to be added: MSan needs every dependency including "std"
+  # rebuilt instrumented, and uninstrumented tree-sitter reports false positives
+  # all day. TSan waits for concurrency to return. Valgrind would duplicate ASan.
+  asan:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    env:
+      CC: clang
+      CFLAGS: -fsanitize=address
+      RUSTFLAGS: -Zsanitizer=address
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # "-Zsanitizer" is still unstable, hence the nightly toolchain above. No
+      # "+nightly" here: the action already made it the default, and naming it
+      # twice means a later pin to a dated nightly silently disagrees with it.
+      - run: cargo test --target x86_64-unknown-linux-gnu
+      # Prove the C was actually instrumented. "ASAN_OPTIONS=verbosity=1" does
+      # NOT do this: it prints runtime init and the shadow layout, not a module
+      # list, so it looks identical whether or not the grammars were built with
+      # "-fsanitize=address". Check for the symbols directly.
+      #
+      # "find" rather than a hardcoded "target/<triple>/debug/build/..." glob:
+      # that path is cargo's business and it moves. The runner already proved
+      # it, laying the objects out as "build/tree-sitter-c/<hash>/out" where
+      # the local cargo writes "build/tree-sitter-c-<hash>/out". Both spellings
+      # are matched, and the second is anchored on a whole path component so it
+      # cannot pick up tree-sitter-cpp. On no match this prints the objects that
+      # DO exist, so the next run says where they went instead of failing with
+      # an unexpanded glob and no information.
+      - name: Verify the grammars carry ASan instrumentation
+        run: |
+          objs=$(find target \( -path '*tree-sitter-c-*/out/*.o' \
+                                -o -path '*/tree-sitter-c/*/out/*.o' \))
+          if [ -z "$objs" ]; then
+            echo "no tree-sitter-c objects under target/; what is there:"
+            find target -name '*.o' -path '*tree-sitter*' | head -20
+            exit 1
+          fi
+          echo "$objs"
+          nm $objs | grep -q __asan_
+
+  # UBSan is C-only: Rust has no "-Zsanitizer=undefined", so "RUSTFLAGS" is left
+  # alone here and only the grammars are instrumented. Stable toolchain,
+  # therefore, unlike the ASan job.
+  #
+  # The runtime form needs help linking: rustc drives the final link with "cc"
+  # and never adds libclang_rt.ubsan, so the build dies on undefined
+  # "__ubsan_handle_*" referenced from the tree-sitter scanners. "-Clinker=clang
+  # -Clink-arg=-fsanitize=undefined" supplies it, which is why "RUSTFLAGS" is
+  # set here even though Rust itself has no "-Zsanitizer=undefined" and none of
+  # the Rust code is instrumented.
+  #
+  # Trap mode ("-fsanitize-trap=undefined") was tried first because it needs no
+  # runtime at all. It works, but a finding then arrives as a test killed by
+  # SIGILL with no message, which is nearly useless in a CI log: the first real
+  # finding cost a full round trip to learn nothing but "something, somewhere".
+  # A sanitizer that cannot say what it found is not worth the job slot.
+  ubsan:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    env:
+      # "-fno-sanitize=function" is the one check turned off, and it is turned
+      # off because the finding is upstream and not ours to fix. tree-sitter's
+      # parser.c:369 stores every grammar's external-scanner entry points in a
+      # "void *(*)(void)" table and calls them through it with their real
+      # signatures, so the "function" check fires once per grammar with an
+      # external scanner (rust, bash). Calling through an incompatible function
+      # pointer type is UB by the letter of C, and it is also a decades-old C
+      # dispatch idiom that the check only started flagging when clang 17 began
+      # enabling it for C. Fixing it means patching a pinned third-party crate.
+      # Every other UBSan check stays on, so the memory-shaped UB this job
+      # exists to catch still fails the run. Retry without this flag whenever
+      # tree-sitter is bumped.
+      CC: clang
+      CFLAGS: -fsanitize=undefined -fno-sanitize=function
+      RUSTFLAGS: -Clinker=clang -Clink-arg=-fsanitize=undefined
+      # Print the file, line, and kind of UB rather than just the summary line,
+      # and keep going so one finding does not hide the rest.
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Findings go to stderr and do not fail the process, so the run is teed
+      # and inspected below. Without that a "runtime error:" line scrolls past
+      # in a green log and nobody ever reads it.
+      #
+      # "pipefail" is not optional here: GitHub's default shell is "bash -e"
+      # WITHOUT it (the log line reads "shell: /usr/bin/bash -e {0}"), so the
+      # pipeline would report tee's exit status and a failing test suite would
+      # sail through as a green job.
+      - run: |
+          set -o pipefail
+          cargo test --no-fail-fast 2>&1 | tee ubsan.log
+      - name: Report UBSan findings
+        run: |
+          if grep -n 'runtime error:' ubsan.log; then
+            echo "::error::UBSan reported undefined behavior in the linked C"
+            exit 1
+          fi
+          echo "no UBSan findings"
+      # Same reasoning as the ASan verify step: a green run proves nothing if
+      # "CFLAGS" never reached the grammars.
+      - name: Verify the grammars carry UBSan instrumentation
+        run: |
+          objs=$(find target -path '*tree-sitter*/out/*.o')
+          if [ -z "$objs" ]; then
+            echo "no tree-sitter objects under target/; what is there:"
+            find target -name '*.o' | head -20
+            exit 1
+          fi
+          echo "$objs"
+          # Across all the grammar objects, not one of them: which UBSan checks
+          # a given translation unit needs depends on what it does, and a table
+          # driven parser.c can legitimately need none.
+          nm $objs | grep -q __ubsan_
+
   build:
     name: ${{ matrix.name }}
     strategy:

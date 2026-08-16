@@ -1,0 +1,42 @@
+//! DO NOT REFLOW THIS FILE. It is test input, not source: running the tool on
+//! it destroys the very shapes it exists to hold. Exclude tests/corpus when
+//! reflowing the repo's own sources.
+//!
+//! Rust shapes: nested block comments, a fenced code block, a markdown table, a
+//! `//` sequence inside a raw string that is not a comment, and an unterminated
+//! nested block at the end of the file.
+
+/// Parse one line of input into a token, returning `None` at end of input,
+/// which is the shape a badly wrapped doc comment takes.
+///
+/// # Examples
+///
+/// ```
+/// let t = parse("x = 1");
+/// assert!(t.is_some());
+/// ```
+///
+/// # Panics
+///
+/// Never. The table below documents what each mode does, and its bars are
+/// alignment rather than prose.
+///
+/// | mode  | reads | writes |
+/// |-------|-------|--------|
+/// | strict| yes   | no     |
+/// | lax   | yes   | yes    |
+pub fn parse(_s: &str) -> Option<()> {
+    None
+}
+
+/* Rust block comments nest, so /* this inner opener really does open a comment
+ * and the closer below belongs to it */ and the outer comment is still open
+ * here until this line ends it.
+ */
+pub const NESTED: u32 = 1;
+
+pub const NOT_A_COMMENT: &str = r"a raw string holding // and /* which the grammar never reports as comments";
+
+/* An unterminated /* nested block at the end of the file swallows the rest, so
+ * nothing may follow it.
+ */

@@ -16,6 +16,11 @@ pub mod normalize;
 pub mod parse;
 pub mod reflow;
 pub mod rewrite;
+
+// Nothing outside the crate calls into this module; "parse" is the only caller.
+// Keeping it crate-private says so, rather than publishing a module whose every
+// item is "pub(crate)" anyway.
+pub(crate) mod signature;
 pub mod textline;
 
 /// Byte range to delete when a comment is moved out of its spot (transforms 3
@@ -75,9 +80,11 @@ fn comment_move_delete_span(source: &str, c: &parse::Comment, backward: bool) ->
 /// body-opening "{" (a comment between a function signature and its body, the
 /// unrelocated manual-page position, belongs with the function, not split off
 /// above), when a blank line is already there, when the comment sits at file
-/// start, and when the previous line is itself a comment (don't fracture a
-/// stacked comment). Doc comments are never touched at all: a blank line
-/// detaches a Rust or Doxygen doc comment from the item it documents.
+/// start, when it sits directly under the file's "#!" shebang (the header
+/// belongs with the preamble, and the rule would otherwise fire on every shell
+/// script there is), and when the previous line is itself a comment (don't
+/// fracture a stacked comment). Doc comments are never touched at all: a blank
+/// line detaches a Rust or Doxygen doc comment from the item it documents.
 /// "multiline" says the comment is still multi-line after reflow; one that the
 /// source split needlessly collapses to a single line no longer qualifies.
 ///
@@ -110,7 +117,7 @@ fn blank_line_before(
     while directive_start > 0 {
         let before_end = directive_start - 1;
         let before_start = parse::line_start_before(source, before_end);
-        if !source[before_start..before_end].trim_end().ends_with('\\') {
+        if !parse::ends_with_line_splice(&source[before_start..before_end]) {
             break;
         }
         directive_start = before_start;
@@ -121,16 +128,43 @@ fn blank_line_before(
         return None;
     }
 
-    // A comment opening a preprocessor conditional block ("#if"/"#ifdef"/
-    // "#ifndef"/"#else"/"#elif") is the first thing inside that block: the same
-    // first-statement-in-a-block case as "{" above, so no blank line.
-    // "#endif"/"#define"/"#include" don't open a scope and are left alone.
+    // One parser for the two "#" lines that mean "this comment is not explaining
+    // me". Splitting them was how the BOM strip below ended up on only one of
+    // the pair, which left a BOM'd file whose first line is "#ifndef GUARD"
+    // failing a test its BOM-free twin passes. U+FEFF is not Unicode
+    // White_Space, so "trim" leaves it glued to the "#".
+    //
+    // - "#!" on line 1 of a SHELL file is the file's preamble. The header below it
+    //   belongs flush against it, and without this the rule fires on
+    //   essentially every shell script in existence, detaching its header from
+    //   line 1 and splitting a "#! nix-shell -i bash" run off the shebang it
+    //   belongs to, which some interpreters require. Gated on "prev_start == 0"
+    //   because a "#!" anywhere else is an ordinary comment, per exec(2).
+    // - "#if"/"#ifdef"/"#ifndef"/"#else"/"#elif" open a conditional block, so
+    //   the comment is the first thing inside it: the "{" case above in its
+    //   "#"-directive form. "#endif"/"#define"/"#include" open no scope and are
+    //   left alone.
     if let Some(rest) = source[directive_start..directive_end]
         .trim()
+        .trim_start_matches('\u{feff}')
+        .trim_start()
         .strip_prefix('#')
     {
+        // "#!" takes "rest" untrimmed: a shebang is the two bytes "#!" with
+        // nothing between them, so "# !x" is an ordinary comment. The
+        // directives take the trimmed form, because "#  if" is valid cpp.
+        //
+        // Shell only, and that gate is load-bearing rather than tidiness:
+        // "#![no_std]" is a Rust inner attribute in exactly the same position,
+        // and reading it as a shebang suppressed the blank line under it. The
+        // extensionless-shebang carve-out lands on Shell too, so the scripts
+        // that need this still get it.
         let d = rest.trim_start();
-        if d.starts_with("if") || d.starts_with("else") || d.starts_with("elif") {
+        if (lang == parse::Language::Shell && prev_start == 0 && rest.starts_with('!'))
+            || d.starts_with("if")
+            || d.starts_with("else")
+            || d.starts_with("elif")
+        {
             return None;
         }
     }

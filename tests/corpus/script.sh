@@ -1,0 +1,28 @@
+﻿#!/usr/bin/env bash
+# DO NOT REFLOW THIS FILE. It is test input, not source: running the tool on it
+# destroys the very shapes it exists to hold. Exclude tests/corpus when
+# reflowing the repo's own sources.
+#
+# Shell shapes: a BOM before the shebang, a "#" run that reflows, a "#!" line in
+# the middle of the file that is an ordinary comment, a "#" inside a string and
+# inside a heredoc that is not a comment at all, and ASCII art.
+set -eu
+
+# This paragraph is one long source line that has to wrap, which is the whole reason the reflow exists, and the run above it must keep its own marker column.
+
+#!/bin/sh is a comment here, not a shebang: only byte 0 of the file gets that
+# reading, per exec(2).
+
+#      +-------+     +--------+
+#      | input | --> | output |
+#      +-------+     +--------+
+
+echo 'a # inside single quotes is not a comment'
+echo "neither is a # inside double quotes"
+
+cat <<'EOF'
+# a heredoc body is data, not shell source, so this line is untouched even
+# though it looks exactly like a comment run that wants reflowing badly enough
+EOF
+
+exit 0
