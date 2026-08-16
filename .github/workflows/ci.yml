@@ -3,22 +3,22 @@ name: check
 on:
   push:
   pull_request:
-  # Dependencies are pinned with `=`, so a newly disclosed advisory will never
+  # Dependencies are pinned with "=", so a newly disclosed advisory will never
   # arrive on its own. The weekly run is what turns the audit job below into an
   # actual alarm rather than a check that only fires when someone pushes.
   schedule:
     - cron: '17 4 * * 1'
 
-# Runner images are pinned to a release rather than `-latest`, so an image
+# Runner images are pinned to a release rather than "-latest", so an image
 # rollover is a deliberate bump in this file instead of a surprise on a Monday.
 jobs:
-  # Windows is in this matrix because the `build` job below ships a Windows
+  # Windows is in this matrix because the "build" job below ships a Windows
   # binary, and a released artifact whose test suite has never run on the target
   # is a promise nobody checked. It is also the platform where this tool differs
-  # most: `write_atomic` compiles out its whole `#[cfg(unix)]` permission branch,
-  # `fs::rename` has its own replace semantics, and line endings are load-bearing
-  # throughout (`had_crlf`, `spans_bare_cr`). Compiling that is not the same as
-  # running it. `.gitattributes` pins `* -text` so a Windows checkout is byte
+  # most: "write_atomic" compiles out its whole "#[cfg(unix)]" permission branch,
+  # "fs::rename" has its own replace semantics, and line endings are load-bearing
+  # throughout ("had_crlf", "spans_bare_cr"). Compiling that is not the same as
+  # running it. ".gitattributes" pins "* -text" so a Windows checkout is byte
   # identical to a Linux one, which keeps the corpus fixtures honest.
   check:
     strategy:
@@ -33,13 +33,13 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # fmt, clippy -D warnings, and the test suite. Same script a contributor
-      # runs locally, so CI cannot drift from `make indent` plus `cargo test`.
-      # `shell: bash` picks Git Bash on the Windows runner, whose default is
+      # runs locally, so CI cannot drift from "make indent" plus "cargo test".
+      # "shell: bash" picks Git Bash on the Windows runner, whose default is
       # pwsh; the script itself stays one script for every platform.
       - run: ./scripts/check.sh
         shell: bash
 
-  # `rust-version` in Cargo.toml is a promise. This is the only thing that keeps
+  # "rust-version" in Cargo.toml is a promise. This is the only thing that keeps
   # it honest: the crate uses let-chains, stabilized in 1.88, so that is the
   # floor until something newer is used.
   msrv:
@@ -84,7 +84,130 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - uses: actions/upload-artifact@v4
+      # tar, not zip, on every platform including Windows: bsdtar has shipped in
+      # Windows since 10 1803, and one archive format keeps the download
+      # instructions in README one line instead of three. A tarball also carries
+      # the executable bit, which a bare binary served over HTTPS does not.
+      - name: Package
+        shell: bash
+        run: |
+          tar czf commentflow-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release \
+            commentflow${{ runner.os == 'Windows' && '.exe' || '' }}
+      - uses: actions/upload-artifact@v7
         with:
           name: commentflow-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/commentflow${{ runner.os == 'Windows' && '.exe' || '' }}
+          path: commentflow-${{ matrix.target }}.tar.gz
+
+  # A rolling "latest" release, so the newest main build is one download away
+  # instead of behind a login wall with a 90-day expiry, which is all the
+  # artifacts above are. It needs "check" as well as "build": shipping a binary
+  # whose test suite went red is worse than shipping nothing.
+  #
+  # Delete and recreate rather than upload "--clobber": the "latest" tag has to
+  # move to the commit that produced these binaries, and there is no gh
+  # invocation that repoints an existing tag. That leaves a window where the
+  # release is gone and its replacement does not exist yet, which drives the two
+  # rules below. "cancel-in-progress: false" queues a second push behind this
+  # job instead of killing it mid-window, and the assets are staged and counted
+  # before anything is deleted, so a missing artifact fails while the old
+  # release is still up.
+  release:
+    needs: [check, build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-latest
+      cancel-in-progress: false
+    # No checkout: nothing here reads the tree, and gh resolves the repo from
+    # GH_REPO rather than a git remote.
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          # Without a pattern this collects every artifact in the run, so any
+          # artifact added to another job later would silently ship as a release
+          # asset.
+          pattern: commentflow-*
+          path: dist
+          merge-multiple: true
+      # Name every asset rather than counting them. A bare count passes when a
+      # target is renamed or swapped for another, which publishes the wrong set
+      # under a name users are told to trust; the names are also what README
+      # documents, so they are the actual contract. This list duplicates the
+      # "build" matrix on purpose: Actions has no YAML anchors, and threading
+      # the targets through a setup job's "fromJSON" output buys one less
+      # duplicated line at the cost of a whole extra job. A rename now fails
+      # here instead of shipping quietly.
+      #
+      # The glob is also what guards against gh receiving a literal
+      # "dist/*.tar.gz" when nothing matched.
+      - name: Stage assets
+        run: |
+          expected=(
+            commentflow-x86_64-unknown-linux-gnu.tar.gz
+            commentflow-aarch64-apple-darwin.tar.gz
+            commentflow-x86_64-pc-windows-msvc.tar.gz
+          )
+          shopt -s nullglob
+          found=(dist/*.tar.gz)
+          missing=()
+          for name in "${expected[@]}"; do
+            [ -f "dist/$name" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -ne 0 ] || [ ${#found[@]} -ne ${#expected[@]} ]; then
+            echo "release assets do not match the expected set" >&2
+            echo "  missing: ${missing[*]:-none}" >&2
+            echo "  found:   ${found[*]:-none}" >&2
+            exit 1
+          fi
+          printf 'dist/%s\n' "${expected[@]}" > assets.txt
+      # Read the HTTP status rather than branching on gh's exit code. gh exits
+      # nonzero for every HTTP failure alike, so "if gh ... ; then" reads a 500,
+      # a revoked token, or a DNS blip as "no release here" and walks straight
+      # into the deletions below. Only 200 and 404 are answers; anything else is
+      # an unknown state, and deleting things from an unknown state is how the
+      # tag of a live release gets removed.
+      - name: Replace the latest release
+        run: |
+          status_of() {
+            gh api "$1" --silent -i 2>/dev/null | head -1 | awk '{print $2}'
+          }
+          require_answer() {
+            case "$1" in
+              200|404) return 0 ;;
+            esac
+            echo "unexpected status '${1:-none}' querying $2; aborting before any deletion" >&2
+            exit 1
+          }
+
+          release_status=$(status_of "repos/$GH_REPO/releases/tags/latest")
+          require_answer "$release_status" "the latest release"
+          if [ "$release_status" = 200 ]; then
+            gh release delete latest --yes --cleanup-tag
+          fi
+
+          # The tag can outlive the release: deleting a release in the web UI
+          # leaves its tag behind, and so does a run that got as far as the
+          # delete and then failed. "gh release create" ignores "--target" when
+          # the tag already exists (the API documents "target_commitish" as
+          # unused in that case), so a stale "latest" tag would publish these
+          # binaries under a release pointing at an older commit.
+          #
+          # Query this only after the delete above: "--cleanup-tag" already
+          # removes the tag, so a status read taken earlier would send us to
+          # delete a ref that no longer exists, and that 404 would fail the step.
+          tag_status=$(status_of "repos/$GH_REPO/git/ref/tags/latest")
+          require_answer "$tag_status" "the latest tag"
+          if [ "$tag_status" = 200 ]; then
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/latest" >/dev/null
+          fi
+          mapfile -t assets < assets.txt
+          gh release create latest "${assets[@]}" \
+            --target "$GITHUB_SHA" \
+            --title "latest" \
+            --notes "Automated build of ${GITHUB_SHA:0:7} on $(date -u +%Y-%m-%d)."
